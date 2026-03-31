@@ -24,6 +24,34 @@ async function getSpotifyToken() {
 
 const fmtDuration = (ms) => { if (!ms) return ''; let val = ms; if (val > 10000000) val = Math.round(val / 1000); const s = Math.round(val / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 
+function detectReleaseType(tracks, albumType) {
+  if (albumType === 'compilation' || albumType === 'appears_on') return 'VA';
+  const count = tracks.length;
+  if (count <= 0) return '';
+  if (count === 1) return 'Single';
+  if (count <= 3) return 'Single';
+  if (count <= 6) return 'EP';
+  return 'Album';
+}
+
+function exportCSV(results) {
+  const header = 'Artist,Release Name,Release Type,Release Date,Label,Catalog Number,Genre,Track Name,ISRC,BPM,Key,Duration';
+  const esc = (s) => `"${(s || '').replace(/"/g, '""')}"`;
+  const rows = results.flatMap(a =>
+    a.tracks.map(t => [
+      esc(a.artists), esc(a.albumName), esc(a.releaseType || ''), esc(a.releaseDate),
+      esc(a.label), esc(a.catalog), esc(a.genre),
+      esc(t.name), esc(t.isrc), esc(t.bpm), esc(t.key), esc(fmtDuration(t.duration)),
+    ].join(','))
+  );
+  const csv = [header, ...rows].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `analyzing-data-${Date.now()}.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function App() {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
@@ -92,8 +120,9 @@ export default function App() {
 
     setResults([]);
     const artistName = artist.name;
+    console.log(`[Step 1] Artist locked: ${artistName} (id: ${artist.id})`);
 
-    // ── STEP 1: Discovery — Spotify /artists/{id}/albums ──────────────────
+    // ── STEP 2: Discovery — Spotify /artists/{id}/albums ──────────────────
     setStatus(`Fetching ${artistName}'s discography...`);
     const token = await getSpotifyToken();
     if (!token) { setLoading(false); setStatus('Could not get Spotify token.'); return; }
@@ -107,7 +136,9 @@ export default function App() {
         if (!res.ok) break;
         const data = await res.json();
         page++;
-        setStatus(`Page ${page}… (${albumShells.length + (data.items?.length || 0)} releases)`);
+        const count = albumShells.length + (data.items?.length || 0);
+        setStatus(`Fetching album ${count} of ${data.total || '?'}...`);
+        console.log(`[Step 2] Page ${page}: ${data.items?.length || 0} albums (total so far: ${count})`);
         for (const a of (data.items || [])) {
           albumShells.push({
             id: a.id, name: a.name,
@@ -121,14 +152,14 @@ export default function App() {
       } catch { break; }
     }
 
+    console.log(`[Step 2] Discovery complete: ${page} pages → ${albumShells.length} total albums`);
     if (!albumShells.length) { setLoading(false); setStatus('No releases found on Spotify.'); return; }
-    setStatus(`Found ${albumShells.length} releases — fetching tracks & enriching...`);
 
-    // ── STEP 2 + 3: Per-album track fetch + Beatport enrichment ───────────
+    // ── STEP 3: Per-album track fetch + Beatport enrichment ───────────────
     const albumResults = [];
     for (let ai = 0; ai < albumShells.length; ai++) {
       const shell = albumShells[ai];
-      setStatus(`Enriching ${ai + 1}/${albumShells.length}: ${shell.name}`);
+      setStatus(`Enriching ${ai + 1} of ${albumShells.length}: ${shell.name}`);
 
       // Fetch full album + tracks with ISRCs
       let tracks = [];
@@ -147,6 +178,7 @@ export default function App() {
                   name: t.name || '', isrc: t.external_ids?.isrc || '',
                   duration: t.duration_ms || 0, bpm: '', key: '',
                   artists: (t.artists || []).map(a => a.name).join(', '),
+                  _noBeatport: false,
                 })));
               }
             }
@@ -154,16 +186,21 @@ export default function App() {
         }
       } catch {}
 
+      console.log(`[Step 3] Enriching album: ${shell.name} → ${tracks.length} tracks`);
+      setStatus(`Enriching track ISRCs... (${ai + 1}/${albumShells.length}: ${shell.name})`);
+
       // Beatport enrichment — full context
       let label = '', catalog = '', genre = '';
       const firstIsrc = tracks.find(t => t.isrc)?.isrc || '';
       const firstTrackName = tracks[0]?.name || '';
+      let bpMatched = false;
       try {
         const bpRes = await fetch(`/api/beatport-genre?artist=${encodeURIComponent(shell.artists)}&q=${encodeURIComponent(shell.name)}&isrc=${firstIsrc}&track=${encodeURIComponent(firstTrackName)}`);
         if (bpRes.ok) {
           const bp = await bpRes.json();
           const goodMatch = ['isrc', 'release', 'track+artist+release', 'track+artist', 'catalog+artist', 'track+release'].includes(bp.matchType);
           if (goodMatch) {
+            bpMatched = true;
             genre = bp.genre || '';
             label = bp.label || '';
             catalog = bp.catalogNumber || '';
@@ -173,14 +210,26 @@ export default function App() {
               const isSingle = tracks.length === 1;
               t.bpm = td.bpm || (isSingle ? bp.bpm : '') || '';
               t.key = td.key || (isSingle ? bp.key : '') || '';
+              if (!t.bpm && !t.key) t._noBeatport = true;
+              if (t.bpm || t.key) {
+                console.log(`[Step 3] Track: ${t.name} (ISRC: ${t.isrc}) → ${t.bpm}bpm, ${t.key}, ${genre}`);
+              }
             }
           }
         }
       } catch {}
 
+      // Mark tracks with no Beatport data
+      if (!bpMatched) {
+        for (const t of tracks) t._noBeatport = true;
+      }
+
+      const releaseType = detectReleaseType(tracks, shell.albumGroup);
+
       albumResults.push({
         albumName: shell.name,
         albumType: shell.albumGroup || shell.albumType || '',
+        releaseType,
         artwork: shell.artworkUrl,
         artists: shell.artists,
         releaseDate: shell.releaseDate,
@@ -194,7 +243,9 @@ export default function App() {
     }
 
     const totalTracks = albumResults.reduce((s, a) => s + a.tracks.length, 0);
-    setStatus(`Done — ${albumResults.length} releases · ${totalTracks} tracks`);
+    const enrichedTracks = albumResults.reduce((s, a) => s + a.tracks.filter(t => !t._noBeatport).length, 0);
+    setStatus(`Done — ${albumResults.length} releases · ${totalTracks} tracks · ${enrichedTracks} enriched`);
+    console.log(`[Done] ${albumResults.length} releases, ${totalTracks} tracks, ${enrichedTracks} enriched`);
     setLoading(false);
   };
 
@@ -267,8 +318,19 @@ export default function App() {
           </button>
         </div>
 
-        {/* Status */}
-        {status && <div style={{ fontSize: 12, color: loading ? T.accent : T.textMid, marginBottom: 20, textAlign: 'center' }}>{status}</div>}
+        {/* Status + Export */}
+        {status && (
+          <div style={{ fontSize: 12, color: loading ? T.accent : T.textMid, marginBottom: 20, textAlign: 'center', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
+            <span>{status}</span>
+            {!loading && results.length > 0 && (
+              <button onClick={() => exportCSV(results)} style={{ padding: '4px 14px', background: T.surfaceAlt, border: `1px solid ${T.border}`, borderRadius: 8, color: T.accent, fontFamily: font, fontSize: 11, fontWeight: 700, cursor: 'pointer', transition: 'all 0.15s' }}
+                onMouseEnter={e => { e.currentTarget.style.background = T.accentGlow; e.currentTarget.style.borderColor = T.accent; }}
+                onMouseLeave={e => { e.currentTarget.style.background = T.surfaceAlt; e.currentTarget.style.borderColor = T.border; }}>
+                Export CSV
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Results */}
         {results.map((album, ai) => (
@@ -280,7 +342,7 @@ export default function App() {
                 <div style={{ fontSize: 15, fontWeight: 700 }}>{album.albumName || 'Unknown'}</div>
                 <div style={{ fontSize: 12, color: T.textMid, marginTop: 2, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
                   {album.artists}
-                  {album.albumType && <span style={{ color: T.white, fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', textTransform: 'uppercase' }}>{album.albumType === 'compilation' ? 'VA' : album.albumType}</span>}
+                  {album.releaseType && <span style={{ color: T.white, fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 4, background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)' }}>{album.releaseType}</span>}
                   {album.genre && <span style={{ color: T.danger, fontSize: 10, padding: '1px 6px', borderRadius: 4, background: 'rgba(232,84,84,0.15)' }}>{album.genre}</span>}
                   {album.catalog && <span style={{ color: T.white, fontSize: 10, fontFamily: fontMono, padding: '1px 6px', borderRadius: 4, background: 'rgba(255,255,255,0.08)' }}>{album.catalog}</span>}
                   {album.label && <span style={{ color: T.accent, fontSize: 10, padding: '1px 6px', borderRadius: 4, background: T.accentGlow }}>{album.label}</span>}
@@ -300,6 +362,7 @@ export default function App() {
                   {t.duration > 0 && <span style={{ fontSize: 10, color: T.textDim, fontFamily: fontMono }}>{fmtDuration(t.duration)}</span>}
                   {t.bpm && <span style={{ color: '#4FC3F7', fontSize: 10, padding: '1px 5px', borderRadius: 4, background: 'rgba(79,195,247,0.08)' }}>{t.bpm} BPM</span>}
                   {t.key && <span style={{ color: '#4FC3F7', fontSize: 10, padding: '1px 5px', borderRadius: 4, background: 'rgba(79,195,247,0.08)' }}>{t.key}</span>}
+                  {t._noBeatport && !t.bpm && !t.key && <span style={{ fontSize: 9, color: T.textDim, fontStyle: 'italic' }}>No Beatport data</span>}
                   <span style={{ fontFamily: fontMono, fontSize: 10, color: T.textDim }}>{t.isrc}</span>
                 </div>
               ))}
